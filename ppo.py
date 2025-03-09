@@ -1,117 +1,81 @@
-import gymnasium as gym
-from stable_baselines3.common.env_util import make_vec_env
-import numpy as np
-from torch import nn
+import argparse
 from distutils.util import strtobool
-from torch.distributions import Categorical
+import os
+
+import gymnasium as gym
+from gymnasium.wrappers import RecordVideo
+import numpy as np
 import torch
+from stable_baselines3.common.env_util import make_vec_env
 from torch import optim
 from torch.utils.tensorboard import SummaryWriter
-import argparse
 
-def parse_args():
-    parser = argparse.ArgumentParser()
-
-    parser.add_argument("--exp-name", type=str, help="the name of the experiment")
-    parser.add_argument("--share", type=lambda x: bool(strtobool(x)), default=False, help="if the critic and the actor share model weights")
-    parser.add_argument("--seed", type=int, default=40, help="seed of the experiment")
-    parser.add_argument("--cuda", type=lambda x: bool(strtobool(x)), default=False, help="if toggled, cuda will be enabled by default")
-    parser.add_argument("--total-timestamp", type=int, default=1000000, help="total number of steps performed during the training")
-    parser.add_argument("--learning-rate", type=float, default=3e-4, help="the learning rate of the optimizer")
-    parser.add_argument("--num-steps", type=int, default=128, help="number of steps to run in each env")
-    parser.add_argument("--n-envs", type=int, default=16, help="the number of env run in parallel")
-    parser.add_argument("--num-minibatches", type=int, default=8, help="number of mini-batches")
-    parser.add_argument("--gamma", type=float, default=0.99, help="the discount factor gamma")
-    parser.add_argument("--gae-lambda", type=float, default=0.95, help="used for advantage estimation")
-    parser.add_argument("--clip-eps", type=float, default=0.2, help="Clipping parameter")
-    parser.add_argument("--n-epochs", type=int, default=10, help="number of epoch when optimizing the surrogate loss")
-    parser.add_argument("--ent-coeff", type=float, default=0.01, help="Entropy coefficient for the loss calculation")
-    parser.add_argument("--vf-coeff", type=float, default=0.5, help="value function coefficient for the loss calculation")
-
-    args = parser.parse_args()
-
-    return args
-    
-    
-
-
-class Shared_Model(nn.Module):
-    def __init__(self, obs_space_shape, action_space_shape):
-        super(Shared_Model, self).__init__()
-        self.obs_space_shape = obs_space_shape
-        self.action_space_shape = action_space_shape
-        self.layer1 = nn.Linear(self.obs_space_shape, 64)
-        self.layer2 = nn.Linear(64,64)
-        self.layer3_actor = nn.Linear(64,action_space_shape)
-        self.layer3_critic = nn.Linear(64,1)
-        self.activation = nn.ReLU()
-    
-    def forward(self, obs):
-        h = self.activation(self.layer1(obs))
-        h = self.activation(self.layer2(h))
-
-        pi = Categorical(logits=self.layer3_actor(h))
-        value = self.layer3_critic(h)
-
-        return pi, value
-
-class Split_Model(nn.Module):
-    def __init__(self, obs_space_shape, action_space_shape):
-        super(Split_Model, self).__init__()
-        self.obs_space_shape = obs_space_shape
-        self.action_space_shape = action_space_shape
-        self.actor = nn.Sequential(
-            nn.Linear(self.obs_space_shape, 64),
-            nn.ReLU(),
-            nn.Linear(64, 64),
-            nn.ReLU(),
-            nn.Linear(64,action_space_shape)
-        )
-        self.critic = nn.Sequential(
-            nn.Linear(self.obs_space_shape, 64),
-            nn.ReLU(),
-            nn.Linear(64, 64),
-            nn.ReLU(),
-            nn.Linear(64,1)
-        )
-    
-    def forward(self, obs):
-        pi = Categorical(logits=self.actor(obs))
-        value = self.critic(obs)
-        return pi, value
+from models import SharedModel, SplitModel
+from utils import normalize, load_config
     
 class Trainer:
+    """
+    Trainer class for running PPO training on a Gym environment.
+    """
+
     def __init__(
         self, 
-        writer,
-        params
-    ):
-        self.num_steps = params.num_steps
-        self.n_envs = params.n_envs
-        self.env = make_vec_env('LunarLander-v3', n_envs=self.n_envs)
-        self.model = Shared_Model(self.env.observation_space.shape[0], self.env.action_space.n) if params.share else Split_Model(self.env.observation_space.shape[0], self.env.action_space.n)
+        writer: SummaryWriter,
+        params: dict
+    ) -> None:
+        """
+        Initializes the Trainer.
+
+        Args:
+            config (dict): Dictionary containing training hyperparameters.
+            writer (SummaryWriter): TensorBoard writer for logging.
+        """
+        self.num_steps = params["num_steps"]
+        self.n_envs = params["n_envs"]
+        self.gym_env_name = params["gym_env"]
+        self.env = make_vec_env(self.gym_env_name, n_envs=self.n_envs)
+        self.model = SharedModel(self.env.observation_space.shape[0], self.env.action_space.n) if params["share"] else SplitModel(self.env.observation_space.shape[0], self.env.action_space.n)
         self.batch_size = self.num_steps*self.n_envs
-        self.mini_batch_size = self.batch_size//params.num_minibatches
-        self.gamma = params.gamma
-        self.lambda_ = params.gae_lambda
-        self.clip_eps = params.clip_eps
-        self.c1 = params.vf_coeff
-        self.c2 = params.ent_coeff
-        self.n_epochs = params.n_epochs
-        self.device = torch.device("cuda" if torch.cuda.is_available() and params.cuda else "cpu")
+        self.mini_batch_size = self.batch_size//params["num_minibatches"]
+        self.gamma = params["gamma"]
+        self.gae_lambda = params["gae_lambda"]
+        self.clip_eps = params["clip_eps"]
+        self.c1 = params["vf_coeff"]
+        self.c2 = params["ent_coeff"]
+        self.n_epochs = params["n_epochs"]
+        self.device = torch.device("cuda" if torch.cuda.is_available() and params["cuda"] else "cpu")
         self.model.to(self.device)
         self.obs = self.to_tensor(self.env.reset()).to(self.device)
-        self.optimizer = optim.Adam(self.model.parameters(), lr=params.learning_rate, eps=1e-5)
-        self.update = (params.total_timestamp+self.batch_size-1)//self.batch_size
+        self.optimizer = optim.Adam(self.model.parameters(), lr=params["learning_rate"], eps=1e-5)
+        self.update = (params["total_timestamp"]+self.batch_size-1)//self.batch_size
         self.writer = writer
         self.loss_step = 0
         self.reward_step = 0
+        self.global_step = 0
+        self.anneal_lr = params["anneal_lr"]
+        self.lr = params["learning_rate"]
 
-    def to_tensor(self,arr):
+    def to_tensor(self,arr: np.ndarray) -> torch.Tensor:
+        """
+        Convert an array-like object to a PyTorch tensor.
+
+        Args:
+            arr: Input array.
+
+        Returns:
+            torch.Tensor: Converted tensor.
+        """
         return torch.tensor(arr, dtype=torch.float)
         
+    @torch.no_grad()
+    def sample(self) -> dict:
+        """
+        Collect samples from the environment using the current policy.
 
-    def sample(self):
+        Returns:
+            dict: Dictionary containing observations, actions, values, log probabilities,
+                  advantages, and rewards.
+        """
         rewards = torch.zeros((self.n_envs, self.num_steps), dtype=torch.float)
         actions = torch.zeros((self.n_envs, self.num_steps), dtype=torch.long)
         dones = torch.zeros((self.n_envs, self.num_steps), dtype=torch.float)
@@ -119,28 +83,34 @@ class Trainer:
         values = torch.zeros((self.n_envs, self.num_steps+1), dtype=torch.float)
         log_probs = torch.zeros((self.n_envs, self.num_steps), dtype=torch.float)
 
-        with torch.no_grad():
-            for t in range(self.num_steps):
-                observations[:,t] = self.obs
-                
-                pi,v = self.model(self.obs)
+        for t in range(self.num_steps):
+            observations[:,t] = self.obs
+            
+            action_distribution,v = self.model(self.obs)
+            action = action_distribution.sample() ### sample epsilon greedy
+            actions[:,t] = action
+            values[:,t] = v.reshape(self.n_envs,).detach()
+            log_probs[:,t] = action_distribution.log_prob(action).detach() ### check the format
 
-                action = pi.sample()
-                actions[:,t] = action
-                values[:,t] = v.reshape(self.n_envs,).detach()
-                log_probs[:,t] = pi.log_prob(action).detach()
+            self.obs, reward, done, info =  self.env.step(action.cpu().numpy())
+            self.obs = self.to_tensor(self.obs).to(self.device)
+            dones[:,t] = self.to_tensor(done)
+            rewards[:,t] = self.to_tensor(reward)
 
-                self.obs, reward, done, _ =  self.env.step(action.cpu().numpy())
-                self.obs = self.to_tensor(self.obs).to(self.device)
-                dones[:,t] = self.to_tensor(done)
-                rewards[:,t] = self.to_tensor(reward)
+            # Log episode rewards and lengths if available
+            for item in info:
+                if "episode" in item.keys():
+                    self.writer.add_scalar("episode/episodic_return", item["episode"]["r"], self.global_step)
+                    self.writer.add_scalar("episode/episodic_length", item["episode"]["l"], self.global_step)
 
+            self.global_step+=1
 
-            _, v = self.model(self.obs)
-            values[:,self.num_steps] = v.reshape(self.n_envs,)
+        # Get value for the final observation
+        _, v = self.model(self.obs)
+        values[:,self.num_steps] = v.reshape(self.n_envs)
         
         advantages = self.GAE(values, rewards, dones)
-        # import pdb; pdb.set_trace()
+
         return {
             'observations': observations.reshape(self.batch_size, *observations.shape[2:]),
             'actions': actions.reshape(self.batch_size, *actions.shape[2:]),
@@ -151,7 +121,13 @@ class Trainer:
         }
     
 
-    def train(self, samples):
+    def train(self, samples: dict) -> None:
+        """
+        Train the model for a fixed number of epochs using mini-batches.
+
+        Args:
+            samples (dict): Dictionary containing training samples.
+        """
         for _ in range(self.n_epochs):
             idx = torch.randperm(self.batch_size)
 
@@ -165,17 +141,15 @@ class Trainer:
 
                 loss = self.compute_loss(mini_batch_samples)
                 self.optimizer.zero_grad()
-
                 loss.backward()
 
+                # Clip gradients for stability
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
 
-                total_norm = 0.0
-                for name, param in self.model.named_parameters():
-                    if param.grad is not None:
-                        param_norm = param.grad.data.norm(2)
-                        total_norm += param_norm.item() ** 2
-                total_norm = total_norm ** 0.5
+                # Calculate and log gradient norm
+                total_norm = sum(
+                    param.grad.data.norm(2).item() ** 2 for param in self.model.parameters() if param.grad is not None
+                ) ** 0.5
                 self.writer.add_scalar(
                     "grad_norm",
                     total_norm, 
@@ -186,35 +160,51 @@ class Trainer:
                 self.optimizer.step()
 
 
-    def compute_loss(self, samples):
+    def compute_loss(self, samples: dict) -> torch.Tensor:
+        """
+        Compute the PPO loss for a mini-batch.
+
+        Args:
+            samples (dict): Mini-batch samples.
+
+        Returns:
+            torch.Tensor: Computed loss.
+        """
         sample_ret = samples["values"]+samples["advantages"]
+        old_values = samples["values"]
+        action_distribution,values = self.model(samples["observations"])
+        log_probs = action_distribution.log_prob(samples["actions"])
+        adv_norm = normalize(samples["advantages"])
 
-        pi,values = self.model(samples["observations"])
-
-        log_probs = pi.log_prob(samples["actions"])
-
-        # import pdb; pdb.set_trace()
-        adv_norm = self.normalize(samples["advantages"])
+        value_f = (sample_ret-values)**2
+        value_pred_clipped = (
+            old_values + torch.clamp(
+                values-old_values, 
+                -self.clip_eps, 
+                self.clip_eps
+            ) - sample_ret
+        )
+        value_f_clipped = (value_pred_clipped - sample_ret)**2
 
         loss = (
             -self.ppo_clip(log_probs, samples["log_prob"], adv_norm).mean()
-            + self.c1 * 0.5 * ((sample_ret-values)**2).mean()
-            - self.c2 * pi.entropy().mean() 
+            + self.c1 * 0.5 * (torch.max(value_f, value_f_clipped)).mean()
+            - self.c2 * action_distribution.entropy().mean() 
         )
-        self.writer.add_scalar("global_train_loss",loss, global_step = self.loss_step)
+        self.writer.add_scalar("global_loss",loss, global_step = self.loss_step)
         self.writer.add_scalar(
-            "ppo_train_loss",
+            "policy_loss",
             self.ppo_clip(log_probs, samples["log_prob"], adv_norm).mean(), 
             global_step = self.loss_step
         )
         self.writer.add_scalar(
-            "value_train_loss",
+            "value_loss",
             ((sample_ret-values)**2).mean(), 
             global_step = self.loss_step
         )
         self.writer.add_scalar(
-            "entropy_train_loss",
-            pi.entropy().mean() , 
+            "entropy_loss",
+            action_distribution.entropy().mean() , 
             global_step = self.loss_step
         )
         self.loss_step+=1
@@ -222,36 +212,52 @@ class Trainer:
         return loss
 
     
-    def GAE(self, values, rewards, dones):
+    def GAE(self, values: torch.Tensor, rewards: torch.Tensor, dones: torch.Tensor) -> torch.Tensor:
         """
-        Generalized Advantage Estimation
+        Compute the Generalized Advantage Estimation (GAE).
+
+        Args:
+            values (torch.Tensor): Estimated state values.
+            rewards (torch.Tensor): Rewards collected.
+            dones (torch.Tensor): Binary flags indicating episode termination.
+
+        Returns:
+            torch.Tensor: Computed advantages.
         """
 
         advantages = torch.zeros_like(rewards)
         last_advantages = 0
-
         for t in reversed(range(self.num_steps)):
             delta = rewards[:,t] + self.gamma * values[:,t+1] * (1.0 - dones[:,t]) - values[:,t]
-
-            advantages[:,t] = last_advantages = delta + self.gamma * self.lambda_ * (1.0 - dones[:,t]) * last_advantages
-
+            advantages[:,t] = last_advantages = delta + self.gamma * self.gae_lambda * (1.0 - dones[:,t]) * last_advantages
         return advantages
     
-    def ppo_clip(self,log_prob, log_prob_old, advantages):
-        ratio = torch.exp(log_prob-log_prob_old)
+    def ppo_clip(self,log_prob: torch.Tensor, log_prob_old: torch.Tensor, advantages: torch.Tensor) -> torch.Tensor:
+        """
+        Calculate the PPO clipped objective.
 
+        Args:
+            log_prob (torch.Tensor): New log probabilities.
+            log_prob_old (torch.Tensor): Old log probabilities.
+            advantages (torch.Tensor): Advantage estimates.
+
+        Returns:
+            torch.Tensor: Clipped PPO loss.
+        """
+        ratio = torch.exp(log_prob-log_prob_old)
         loss = ratio * advantages
         loss_clip = torch.clamp(ratio, 1-self.clip_eps, 1+self.clip_eps) * advantages
-
         return torch.min(loss, loss_clip)
     
-    def normalize(self, vect):
-        return (vect - vect.mean()) / (vect.std() + 1e-8)
-    
     def training_loop(self):
-
+        """
+        Main training loop.
+        """
         for e in range(self.update):
             print(f"{e+1}/{self.update}")
+            if self.anneal_lr:
+                coeff = 1 - (e/self.update)
+                self.optimizer.param_groups[0]["lr"] = coeff * self.lr
             samples = self.sample()
             self.writer.add_scalar(
                 "mean_reward",
@@ -261,45 +267,79 @@ class Trainer:
             self.reward_step += 1
             self.train(samples)
 
-    def test_policy(self, n_eval_episodes=10):
-        env = gym.make("LunarLander-v3")
+    @torch.no_grad()
+    def test_policy(self, n_eval_episodes: int = 10) -> tuple:
+        """
+        Evaluate the current policy over several episodes.
+
+        Args:
+            n_eval_episodes (int, optional): Number of evaluation episodes. Defaults to 10.
+
+        Returns:
+            tuple: Mean and standard deviation of rewards over the episodes.
+        """
+        env = gym.make(self.gym_env_name)
         rewards = [0]*n_eval_episodes
         for n in range(n_eval_episodes):
             observation,_ = env.reset()
             done = False
             while not done:
-                pi, _ = self.model(self.to_tensor(observation).reshape(1,-1).to(self.device))
-                a = torch.argmax(pi.logits).item()
-                observation, reward, done, _, _ = env.step(a)
+                action_distribution, _ = self.model(self.to_tensor(observation).reshape(1,-1).to(self.device))
+                a = torch.argmax(action_distribution.logits).item()
+                observation, reward, done, truncated, _ = env.step(a)
+                done = done or truncated
                 rewards[n] += reward
         return np.mean(rewards), np.std(rewards)
+    
+    @torch.no_grad()
+    def record_video_demo(self, video_folder: str, n_eval_episodes: int = 1, name_prefix: str = "demo") -> None:
+        """
+    Record a video demo of the current policy.
+
+    Args:
+        video_folder (str): Directory where videos will be saved.
+        n_eval_episodes (int, optional): Number of demo episodes to record. Defaults to 1.
+        name_prefix (str, optional): Prefix for the saved video files. Defaults to "demo".
+    """
+
+        os.makedirs(video_folder, exist_ok=True)
+        # Create a new environment wrapped with the video recorder
+        env = gym.make(self.gym_env_name, render_mode="rgb_array")
+        env = RecordVideo(
+            env,
+            video_folder=video_folder,
+            episode_trigger=lambda episode_id: True,
+            name_prefix=name_prefix
+        )
+
+        for episode in range(n_eval_episodes):
+            observation, _ = env.reset()
+            done = False
+            while not done:
+                action_distribution, _ = self.model(self.to_tensor(observation).reshape(1, -1).to(self.device))
+                action = torch.argmax(action_distribution.logits).item()
+                observation, reward, done, truncated, _ = env.step(action)
+                done = done or truncated
+
+        env.close()
 
 
 if __name__ == "__main__":
-    params = parse_args()
-    np.random.seed(params.seed)
-    torch.manual_seed(params.seed)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config-path", type=str, help="The path to the YAML config file for hyperparameters")
+    args = parser.parse_args()
 
-    
+    params = load_config(args.config_path)
 
-    writer = SummaryWriter(f"runs/{params.exp_name}")
+    np.random.seed(params["seed"])
+    torch.manual_seed(params["seed"])
+
+    exp_name = params["exp_name"]
+    os.makedirs("./runs/", exist_ok=True)
+    writer = SummaryWriter(f"runs/{exp_name}")
     trainer = Trainer(writer, params)
     trainer.training_loop()
     print(trainer.test_policy())
 
-    # env = make_vec_env('LunarLander-v3', n_envs=16)
-    # from stable_baselines3 import PPO
-
-    # model = PPO(
-    # policy = 'MlpPolicy',
-    # env = env,
-    # n_steps = 1024,
-    # batch_size = 64,
-    # n_epochs = 4,
-    # gamma = 0.999,
-    # gae_lambda = 0.98,
-    # ent_coef = 0.01,
-    # verbose=1)
-
-    # model.learn(total_timesteps=1000000)
+    trainer.record_video_demo("./tests/", name_prefix=exp_name)
 
