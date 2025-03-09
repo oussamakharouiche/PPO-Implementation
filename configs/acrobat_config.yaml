@@ -1,0 +1,17 @@
+exp_name: "acrobot"
+gym_env: "Acrobot-v1"
+share: false
+seed: 40
+cuda: false
+total_timestamp: 1000000
+learning_rate: 0.00025
+num_steps: 512
+n_envs: 8
+num_minibatches: 64
+gamma: 0.99
+gae_lambda: 0.95
+clip_eps: 0.2
+n_epochs: 4
+ent_coeff: 0.0
+vf_coeff: 0.5
+anneal_lr: true
