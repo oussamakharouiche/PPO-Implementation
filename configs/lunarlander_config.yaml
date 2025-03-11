@@ -1,9 +1,9 @@
 exp_name: "lunarlander"
 gym_env: "LunarLander-v3"
 share: false
-seed: 40
+seed: 35
 cuda: false
-total_timestamp: 1000000
+total_timestamp: 4000000
 learning_rate: 0.00025
 num_steps: 1024
 n_envs: 8
@@ -14,4 +14,4 @@ clip_eps: 0.2
 n_epochs: 4
 ent_coeff: 0.01
 vf_coeff: 0.5
-anneal_lr: true
+anneal_lr: false

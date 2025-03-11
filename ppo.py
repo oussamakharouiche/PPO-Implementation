@@ -173,16 +173,17 @@ class Trainer:
         sample_ret = samples["values"]+samples["advantages"]
         old_values = samples["values"]
         action_distribution,values = self.model(samples["observations"])
+        values = values.squeeze(1)
         log_probs = action_distribution.log_prob(samples["actions"])
         adv_norm = normalize(samples["advantages"])
 
         value_f = (sample_ret-values)**2
         value_pred_clipped = (
-            old_values + torch.clamp(
+            torch.clamp(
                 values-old_values, 
                 -self.clip_eps, 
                 self.clip_eps
-            ) - sample_ret
+            ) + old_values
         )
         value_f_clipped = (value_pred_clipped - sample_ret)**2
 
