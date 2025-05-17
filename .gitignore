@@ -1,4 +1,5 @@
 runs/
 tests/
 model_checkpoints/
+wandb/
 ppo_old.py
