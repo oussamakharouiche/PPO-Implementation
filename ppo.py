@@ -9,6 +9,8 @@ import torch
 from stable_baselines3.common.env_util import make_vec_env
 from torch import optim
 from torch.utils.tensorboard import SummaryWriter
+import wandb 
+import uuid
 
 from models import SharedModel, SplitModel
 from utils import normalize, load_config
@@ -19,8 +21,7 @@ class Trainer:
     """
 
     def __init__(
-        self, 
-        writer: SummaryWriter,
+        self,
         params: dict
     ) -> None:
         """
@@ -45,15 +46,20 @@ class Trainer:
         self.n_epochs = params["n_epochs"]
         self.device = torch.device("cuda" if torch.cuda.is_available() and params["cuda"] else "cpu")
         self.model.to(self.device)
-        self.obs = self.to_tensor(self.env.reset()).to(self.device)
+        observation = self.env.reset()
+        initial_obs = observation[0] if isinstance(observation, tuple) else observation
+        self.obs = self.to_tensor(initial_obs).to(self.device)
         self.optimizer = optim.Adam(self.model.parameters(), lr=params["learning_rate"], eps=1e-5)
         self.update = (params["total_timestamp"]+self.batch_size-1)//self.batch_size
-        self.writer = writer
         self.loss_step = 0
         self.reward_step = 0
         self.global_step = 0
         self.anneal_lr = params["anneal_lr"]
         self.lr = params["learning_rate"]
+        self.total_timesteps_elapsed = 0
+        os.makedirs(os.path.join(os.path.dirname(__file__),"model_checkpoints"), exist_ok=True)
+        self.ckpt_file = os.path.join(os.path.dirname(__file__),f"model_checkpoints/{params['save_file']}.pt")
+
 
     def to_tensor(self,arr: np.ndarray) -> torch.Tensor:
         """
@@ -87,25 +93,27 @@ class Trainer:
             observations[:,t] = self.obs
             
             action_distribution,v = self.model(self.obs)
-            action = action_distribution.sample() ### sample epsilon greedy
+            action = action_distribution.sample()
             actions[:,t] = action
             values[:,t] = v.reshape(self.n_envs,).detach()
-            log_probs[:,t] = action_distribution.log_prob(action).detach() ### check the format
+            log_probs[:,t] = action_distribution.log_prob(action).detach()
 
             self.obs, reward, done, info =  self.env.step(action.cpu().numpy())
             self.obs = self.to_tensor(self.obs).to(self.device)
             dones[:,t] = self.to_tensor(done)
             rewards[:,t] = self.to_tensor(reward)
 
-            # Log episode rewards and lengths if available
+            
             for item in info:
                 if "episode" in item.keys():
-                    self.writer.add_scalar("episode/episodic_return", item["episode"]["r"], self.global_step)
-                    self.writer.add_scalar("episode/episodic_length", item["episode"]["l"], self.global_step)
+                    wandb.log({
+                        "episode/episodic_return": item["episode"]["r"],
+                        "episode/episodic_length": item["episode"]["l"],
+                        "global_step": self.global_step
+                    })
 
             self.global_step+=1
 
-        # Get value for the final observation
         _, v = self.model(self.obs)
         values[:,self.num_steps] = v.reshape(self.n_envs)
         
@@ -150,11 +158,11 @@ class Trainer:
                 total_norm = sum(
                     param.grad.data.norm(2).item() ** 2 for param in self.model.parameters() if param.grad is not None
                 ) ** 0.5
-                self.writer.add_scalar(
-                    "grad_norm",
-                    total_norm, 
-                    global_step = self.loss_step-1
-                )
+                
+                wandb.log({
+                    "train/grad_norm": total_norm, 
+                    "loss_step": self.loss_step
+                })
 
 
                 self.optimizer.step()
@@ -177,37 +185,30 @@ class Trainer:
         log_probs = action_distribution.log_prob(samples["actions"])
         adv_norm = normalize(samples["advantages"])
 
-        value_f = (sample_ret-values)**2
-        value_pred_clipped = (
-            torch.clamp(
-                values-old_values, 
-                -self.clip_eps, 
-                self.clip_eps
-            ) + old_values
-        )
-        value_f_clipped = (value_pred_clipped - sample_ret)**2
+        
+        # Policy loss (surrogate objective)
+        policy_objective = self.ppo_clip(log_probs, samples["log_prob"], adv_norm).mean()
 
-        loss = (
-            -self.ppo_clip(log_probs, samples["log_prob"], adv_norm).mean()
-            + self.c1 * 0.5 * (torch.max(value_f, value_f_clipped)).mean()
-            - self.c2 * action_distribution.entropy().mean() 
-        )
-        self.writer.add_scalar("global_loss",loss, global_step = self.loss_step)
-        self.writer.add_scalar(
-            "policy_loss",
-            self.ppo_clip(log_probs, samples["log_prob"], adv_norm).mean(), 
-            global_step = self.loss_step
-        )
-        self.writer.add_scalar(
-            "value_loss",
-            ((sample_ret-values)**2).mean(), 
-            global_step = self.loss_step
-        )
-        self.writer.add_scalar(
-            "entropy_loss",
-            action_distribution.entropy().mean() , 
-            global_step = self.loss_step
-        )
+        # Value loss
+        value_f = (sample_ret - values)**2
+        value_pred_clipped = old_values + torch.clamp(values - old_values, -self.clip_eps, self.clip_eps)
+        value_f_clipped = (value_pred_clipped - sample_ret)**2
+        vf_loss_term = 0.5 * torch.max(value_f, value_f_clipped).mean()
+
+        # Entropy bonus
+        entropy_term = action_distribution.entropy().mean()
+
+        loss = -policy_objective + self.c1 * vf_loss_term - self.c2 * entropy_term
+
+        wandb.log({
+            "loss/total_loss": loss.item(),
+            "loss/policy_objective": policy_objective.item(), # This is the term to be maximized
+            "loss/value_function_loss": vf_loss_term.item(), # This is the actual vf component in loss
+            "loss/entropy_bonus": entropy_term.item(),
+            "debug/value_loss_unclipped_mse": value_f.mean().item(),
+            "loss_step": self.loss_step
+        })
+
         self.loss_step+=1
 
         return loss
@@ -260,69 +261,15 @@ class Trainer:
                 coeff = 1 - (e/self.update)
                 self.optimizer.param_groups[0]["lr"] = coeff * self.lr
             samples = self.sample()
-            self.writer.add_scalar(
-                "mean_reward",
-                samples["rewards"].mean(), 
-                global_step = self.reward_step
-            )
+            wandb.log({
+                "rollout/mean_reward_in_batch": samples["rewards"].mean().item(), 
+                "reward_step": self.reward_step
+            })
+
             self.reward_step += 1
             self.train(samples)
-
-    @torch.no_grad()
-    def test_policy(self, n_eval_episodes: int = 10) -> tuple:
-        """
-        Evaluate the current policy over several episodes.
-
-        Args:
-            n_eval_episodes (int, optional): Number of evaluation episodes. Defaults to 10.
-
-        Returns:
-            tuple: Mean and standard deviation of rewards over the episodes.
-        """
-        env = gym.make(self.gym_env_name)
-        rewards = [0]*n_eval_episodes
-        for n in range(n_eval_episodes):
-            observation,_ = env.reset()
-            done = False
-            while not done:
-                action_distribution, _ = self.model(self.to_tensor(observation).reshape(1,-1).to(self.device))
-                a = torch.argmax(action_distribution.logits).item()
-                observation, reward, done, truncated, _ = env.step(a)
-                done = done or truncated
-                rewards[n] += reward
-        return np.mean(rewards), np.std(rewards)
-    
-    @torch.no_grad()
-    def record_video_demo(self, video_folder: str, n_eval_episodes: int = 1, name_prefix: str = "demo") -> None:
-        """
-    Record a video demo of the current policy.
-
-    Args:
-        video_folder (str): Directory where videos will be saved.
-        n_eval_episodes (int, optional): Number of demo episodes to record. Defaults to 1.
-        name_prefix (str, optional): Prefix for the saved video files. Defaults to "demo".
-    """
-
-        os.makedirs(video_folder, exist_ok=True)
-        # Create a new environment wrapped with the video recorder
-        env = gym.make(self.gym_env_name, render_mode="rgb_array")
-        env = RecordVideo(
-            env,
-            video_folder=video_folder,
-            episode_trigger=lambda episode_id: True,
-            name_prefix=name_prefix
-        )
-
-        for episode in range(n_eval_episodes):
-            observation, _ = env.reset()
-            done = False
-            while not done:
-                action_distribution, _ = self.model(self.to_tensor(observation).reshape(1, -1).to(self.device))
-                action = torch.argmax(action_distribution.logits).item()
-                observation, reward, done, truncated, _ = env.step(action)
-                done = done or truncated
-
-        env.close()
+        
+        torch.save(self.model.state_dict(), self.ckpt_file)
 
 
 if __name__ == "__main__":
@@ -336,9 +283,21 @@ if __name__ == "__main__":
     torch.manual_seed(params["seed"])
 
     exp_name = params["exp_name"]
-    os.makedirs("./runs/", exist_ok=True)
-    writer = SummaryWriter(f"runs/{exp_name}")
-    trainer = Trainer(writer, params)
+    
+    wandb.init(
+        project=params.get("wandb_project", "PPO_Gymnasium_Implementation"),
+        name=exp_name,
+        id=str(uuid.uuid4()), 
+        config=params,
+        sync_tensorboard=False
+    )
+    wandb.define_metric("train/grad_norm", step_metric="loss_step")
+    wandb.define_metric("loss/*", step_metric="loss_step")
+    wandb.define_metric("debug/value_loss_unclipped_mse", step_metric="loss_step")
+    wandb.define_metric("rollout/mean_reward_in_batch", step_metric="reward_step")
+    wandb.define_metric("episode/*", step_metric="global_step")
+
+    trainer = Trainer(params)
     trainer.training_loop()
     print(trainer.test_policy())
 
