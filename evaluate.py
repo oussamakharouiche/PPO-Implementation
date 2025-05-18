@@ -49,7 +49,7 @@ def record_video(model, env_name, video_folder, device, n_episodes: int, name_pr
     print(f"Saved videos to {video_folder}")
 
 
-def main(config_path: str, checkpoint_path: str, eval_episodes: int, record: bool, record_episodes: int):
+def main(config_path: str, eval_episodes: int, record: bool, record_episodes: int):
     params = load_config(config_path)
     np.random.seed(params.get("seed", 0))
     torch.manual_seed(params.get("seed", 0))
@@ -66,6 +66,7 @@ def main(config_path: str, checkpoint_path: str, eval_episodes: int, record: boo
     model = SharedModel(obs_dim, act_dim) if params.get("share", False) else SplitModel(obs_dim, act_dim)
     model.to(device)
 
+    checkpoint_path = os.path.join(os.path.dirname(__file__),f"model_checkpoints/{params['save_file']}.pt")
     state_dict = torch.load(checkpoint_path, map_location=device)
     model.load_state_dict(state_dict)
     model.eval()
@@ -83,7 +84,6 @@ def main(config_path: str, checkpoint_path: str, eval_episodes: int, record: boo
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Evaluate and/or record a trained PPO model.")
     parser.add_argument("--config-path", type=str, required=True, help="Path to the YAML config file used during training.")
-    parser.add_argument("--checkpoint-path", type=str, required=True, help="Path to the .pt file containing saved model weights.")
     parser.add_argument("--eval-episodes", type=int, default=10, help="Number of evaluation episodes (default: 10).")
     parser.add_argument("--record", type=lambda x: bool(int(x)), default=True, help="Whether to record video demos (0 or 1).")
     parser.add_argument("--record-episodes", type=int, default=1, help="Number of episodes to record if --record is set.")
@@ -91,7 +91,6 @@ if __name__ == "__main__":
 
     main(
         args.config_path,
-        args.checkpoint_path,
         args.eval_episodes,
         args.record,
         args.record_episodes
