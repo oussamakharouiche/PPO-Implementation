@@ -299,7 +299,4 @@ if __name__ == "__main__":
 
     trainer = Trainer(params)
     trainer.training_loop()
-    print(trainer.test_policy())
-
-    trainer.record_video_demo("./tests/", name_prefix=exp_name)
 

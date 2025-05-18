@@ -23,7 +23,8 @@ def evaluate_policy(model, env, device, n_eval_episodes: int):
             done = terminated or truncated
             total_reward += reward
         rewards.append(total_reward)
-        print(f"Episode {ep+1}: reward = {total_reward:.2f}")
+        if (ep+1)%10 == 0:
+            print(f"Episode {ep+1}: reward = {total_reward:.2f}")
 
     mean_reward = np.mean(rewards)
     std_reward = np.std(rewards)
@@ -84,7 +85,7 @@ def main(config_path: str, eval_episodes: int, record: bool, record_episodes: in
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Evaluate and/or record a trained PPO model.")
     parser.add_argument("--config-path", type=str, required=True, help="Path to the YAML config file used during training.")
-    parser.add_argument("--eval-episodes", type=int, default=10, help="Number of evaluation episodes (default: 10).")
+    parser.add_argument("--eval-episodes", type=int, default=100, help="Number of evaluation episodes (default: 10).")
     parser.add_argument("--record", type=lambda x: bool(int(x)), default=True, help="Whether to record video demos (0 or 1).")
     parser.add_argument("--record-episodes", type=int, default=1, help="Number of episodes to record if --record is set.")
     args = parser.parse_args()
