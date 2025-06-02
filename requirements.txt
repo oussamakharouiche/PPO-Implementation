@@ -3,3 +3,5 @@ numpy==2.2.5
 PyYAML==6.0.2
 stable_baselines3==2.6.0
 torch==2.7.0
+tensorboard==2.19.0
+wandb==0.19.11
